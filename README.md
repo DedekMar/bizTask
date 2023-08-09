@@ -8,6 +8,10 @@ To run the script directly:
   ```bash
   python scraper.py
   ```
+Try to use any additional setup of the optional parameters if the script fails when loading websites on your connection
+- `--max-retries` `    :  Maximum number of retries on request failure
+- `--retry-time`    :  Time (in seconds) to wait between retries
+- `--wait-time`    :  Time (in seconds) to wait between page loads
   
 For docker there is a volume set up, so it needs to be specified when running the container to get the resulting .csv file
  ```bash
