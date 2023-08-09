@@ -168,5 +168,5 @@ if __name__ == "__main__":
 
 
 
-    df.to_csv(output, encoding="UTF-16", index = False)
+    df.to_csv(output, sep="\t", encoding="UTF-16", index = False)
     print(df)
