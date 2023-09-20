@@ -4,27 +4,29 @@ import requests
 import time
 import argparse
 import os
-
+import asyncio
 
 class Scraper:
-    def __init__(self, base_url, max_retries = 3, retry_interval = 5, between_req_wait = 5):
+    def __init__(self, base_url : str , semaphore_limit : int = 100, max_retries : int = 3 , retry_interval : float = 5, between_req_wait : float = 5):
         """
         Initializes a Scraper instance.
 
         Args:
             base_url (str): The base URL of the website to be scraped.
+            semaphore_limit (int): The limit that asyncio will set for max coroutines to run concurently. 
             max_retries (int, optional): The maximum number of retries on request failure. Default is 3.
-            retry_interval (int, optional): The time interval (in seconds) between retries. Default is 5.
-            between_req_wait (int, optional): The time interval (in seconds) between page loads. Default is 5.
+            retry_interval (float, optional): The time interval (in seconds) between retries. Default is 5.
+            between_req_wait (float, optional): The time interval (in seconds) between page loads. Default is 5.
         """        
         self.base_url = base_url
+        self.semaphore_limit = semaphore_limit
         self.max_retries = max_retries
         self.retry_interval = retry_interval
         self.between_req_wait = between_req_wait 
 
-    def _get_last_page_number(self):
+    async def _get_last_page_number(self):
         # Extracts and returns the last page number from the website's pagination.
-        response = self._get_response(self.base_url)
+        response = await self._get_response(self.base_url)
         soup = BeautifulSoup(response.content, 'html.parser')
 
         pagination = soup.find("nav", class_ = "pagination")
@@ -56,26 +58,35 @@ class Scraper:
 
         return img_url
     
-    def _get_response(self, page_url):
+    async def _get_response(self, page_url):
         # Sends a GET request to the specified 'page_url' and handles retries according to the 'max_retries' and 'retry_interval' specified during object creation.
         retry_counter = 0
         exception = None
         while retry_counter < self.max_retries:
             try:
-                response = requests.get(page_url)
-                response.raise_for_status()  
-                return response
-            
+                #async with self.semaphore:
+                    response = await asyncio.to_thread(requests.get, page_url)
+                    response.raise_for_status()  
+                    return response
+            except asyncio.CancelledError as e:
+                # This exception occurs if the coroutine is canceled (e.g., due to a timeout)
+                print(e)
+                print(f"Coroutine for {page_url} was canceled due to timeout.")         
             except requests.exceptions.RequestException as e:
-                print(f"Failed to retrieve page {page_url}, sleeping for {self.retry_interval}")
-                retry_counter += 1
-                time.sleep(self.retry_interval)
-                exception = e
+                retry_counter += 1                
+                if response.status_code == 429:
+                    # Implement exponential backoff
+                    wait_time = 2 ** retry_counter
+                    print(f"Received 429 error for {page_url}. Retrying in {wait_time} seconds.")
+                    await asyncio.sleep(wait_time)
+                else:
+                    exception = e
+                    await asyncio.sleep(self.between_req_wait)
         raise exception #Exception(f"Failed to retrieve valid response for {page_url}: e")
                 
         
 
-    def scrape_page(self, page_url):
+    async def scrape_page(self, page_url):
         """
         Scrapes content from a specific page URL and returns a list of results.
 
@@ -86,8 +97,8 @@ class Scraper:
             list: A list of tuples containing scraped data (title, summary, URL, image URL) from the page.
         """
         
+        response = await self._get_response(page_url)
         print(f'Scraping {page_url}')
-        response = self._get_response(page_url)
 
         soup = BeautifulSoup(response.content, 'html.parser')
         article_list = soup.find('div', class_=["entry-list", "entries-articles"])
@@ -107,26 +118,26 @@ class Scraper:
         return results
     
 
-    def scrape_all_pages(self):
-        """
-        Scrapes content from all pages of the website and returns a list of results.
+    async def scrape_all_pages(self):
+        loop = asyncio.get_event_loop()
+        last_page = await self._get_last_page_number()
+        page_range = range(1, last_page + 1)
+        print(f'{last_page} pages found')
 
-        Returns:
-            list: A list of tuples containing scraped data (title, summary, URL, image URL) from all pages.
-        """
-        print(f"Running scraper for {self.base_url} with {self.max_retries} max retries, {self.retry_interval} sec retry interval, {self.between_req_wait} secs between page loads")
-        last_page = self._get_last_page_number()
-        #last_page = 2
-        page_range = self._get_page_range(last_page)
-        print(f'{page_range[-1]} pages found')
+        # create semaphore inside asyncio.run so that it is attached to a correct loop. Use semaphore for request throttling so that we dont overload the server
+        semaphore = asyncio.Semaphore(self.semaphore_limit)
+
         all_results = []
 
-        for page in page_range:
-            page_url = (f'{self.base_url}?p1400={page}')
-            page_results = self.scrape_page(page_url)
-            all_results.extend(page_results)
+        async def scrape_page_async(page):
+            page_url = f'{self.base_url}?p1400={page}'
+            async with semaphore:
+                return await self.scrape_page(page_url)
 
-            time.sleep(self.between_req_wait)  # Wait between requests
+        tasks = [scrape_page_async(page) for page in page_range]
+        results = await asyncio.gather(*tasks)
+        for page_results in results:
+            all_results.extend(page_results)
 
         return all_results
     
@@ -137,8 +148,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Web scraping script with optional arguments")
     #parser.add_argument("--base-url", type=str, required=True, help="Base URL for scraping")
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries on request failure")
-    parser.add_argument("--retry-time", type=int, default=5, help="Time (in seconds) to wait between retries")
-    parser.add_argument("--wait-time", type=int, default=2, help="Time (in seconds) to wait between page loads")
+    parser.add_argument("--retry-time", type=float, default=5, help="Time (in seconds) to wait between retries")
+    parser.add_argument("--wait-time", type=float, default=2, help="Time (in seconds) to wait between page loads")
+    parser.add_argument("--semaphore-limit", type=int, default=5, help="Max concurrent coroutines for asyncio semaphore")
     parser.add_argument("--output", default="data/mnamky.csv", help="Path to the output CSV file")
 
     args = parser.parse_args()
@@ -150,18 +162,21 @@ if __name__ == "__main__":
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=False)
 
+    #semaphore_limit = 5
+
     scraper = Scraper(
         base_url=base_url,
+        semaphore_limit = args.semaphore_limit,
         max_retries=args.max_retries,
         retry_interval=args.retry_time,
         between_req_wait=args.wait_time
         )
 
     try:
-        results = scraper.scrape_all_pages()
+        results = asyncio.run(scraper.scrape_all_pages())
     except Exception as e:
         print(f"An error occurred: {e}")
-        quit()
+        exit()
 
     columns = ['title', 'summary', 'url', 'image_url']
     df = pd.DataFrame(results, columns=columns)
